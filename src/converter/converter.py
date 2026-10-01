@@ -146,7 +146,7 @@ def main() -> None:
         help="Enable weight offloading in local (device) memory. Default is False.",
         default=False,
     )
-    
+
     llm_parser.set_defaults(func=convert_llm)
 
     args = parser.parse_args()

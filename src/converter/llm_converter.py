@@ -83,7 +83,7 @@ class Layer:
             involved_dim = [v == '1' for v in dim_str.split(',')]
             return comm_type, involved_dim
         return s, None
-        
+
 class LLMConverter:
     def __init__(
         self,
@@ -114,7 +114,7 @@ class LLMConverter:
         ]
         metadata = GlobalMetadata(attr=attr)
         return metadata
-    
+
     def get_layers(self, f: TextIOWrapper) -> List[Layer]:
         layers: List[Layer] = []
         for line in f:
@@ -125,7 +125,7 @@ class LLMConverter:
         ret = self.next_node_id
         self.next_node_id += 1
         return ret
-    
+
     def get_next_comm_tag(self) -> int:
         ret = self.next_comm_tag
         self.next_comm_tag += 1
@@ -142,7 +142,7 @@ class LLMConverter:
         node = self.get_node("COMP_NODE_" + layer_name, COMP_NODE)
         node.duration_micros = comp_time
         return node
-    
+
     def get_comm_type(self, comm_type: str) -> int:
         if comm_type == "ALLREDUCE":
             return ALL_REDUCE
@@ -153,7 +153,7 @@ class LLMConverter:
         elif comm_type == "REDUCESCATTER":
             return REDUCE_SCATTER
         return 0
-    
+
     def get_comm_coll_node(self, layer_name: str, comm_type: str, comm_size: int,
                            involved_dim: list = None) -> Any:
         node = self.get_node(f"COMM_COLL_NODE_{layer_name}_{comm_type}", COMM_COLL_NODE)
@@ -189,7 +189,7 @@ class LLMConverter:
         # check if SEND/RECV pair have same tags
         # print(f"name: {node.name}, src: {node.comm_src}, dst: {node.comm_dst}, size: {node.comm_size}, key: {comm_key}, tag: {node.comm_tag}")
         return node
-    
+
     def get_mem_type(self, mem_type: str) -> int:
         mem_type = mem_type.split(':')[0]  # Exclude the device number if present
         if mem_type == "LOCAL":
@@ -201,7 +201,7 @@ class LLMConverter:
         elif mem_type == "STORAGE":
             return MemoryType.STORAGE_MEMORY.value
         return MemoryType.INVALID_MEMORY.value
-    
+
     def get_mem_device(self, mem_type: str) -> int:
         """
         Extract the device index from mem_type.
@@ -262,7 +262,7 @@ class LLMConverter:
         node.attr.append(ChakraAttr(name="tensor_device", uint32_val=self.get_mem_device(mem_type)))
         node.attr.append(ChakraAttr(name="tensor_channel", uint32_val=self.get_mem_channel(mem_type)))
         return node
-        
+
     def add_parent(self, child_node: Any, parent_node: Any) -> None:
         child_node.data_deps.append(parent_node.id)
 
@@ -291,7 +291,7 @@ class LLMConverter:
             else:
                 continue
             ev_ld_cnt += 1
-            
+
         layers = layers[ev_ld_cnt:]
         num_layers -= ev_ld_cnt
 
@@ -331,7 +331,7 @@ class LLMConverter:
                             layers[layer_start].input_memory_loc,
                             layers[layer_start].input_memory_size,
                         )
-                        encode_message(g, input_load_node)                  
+                        encode_message(g, input_load_node)
                     else:
                         if layers[layer_start].is_expert or layers[layer_start].is_pim:
                             # Receive input (from the previous layer in another npu group)
@@ -357,6 +357,8 @@ class LLMConverter:
                             encode_message(g, receive_input_node)
 
                     expert_start = False
+                    expert_parent_node = None
+                    expert_parallel_terminals = []
                     pim_start = False
                     attn_remain = False # to handle remaining prefill attention after pim
                     pim_parent_nodes = []
@@ -365,7 +367,7 @@ class LLMConverter:
                     last_batch_type = "BATCH_1"
                     layer_num = layer_start
                     while expert_start or pim_start or attn_remain or layer_num < layer_end:
-                        if not layers[layer_num].is_expert and not layers[layer_num].is_pim: 
+                        if not layers[layer_num].is_expert and not layers[layer_num].is_pim:
                             if (self.local_offloading or layers[layer_num].weight_memory_loc != "LOCAL") and layers[layer_num].weight_memory_size > 0:
                                 # Load weight (for weight offloading)
                                 weight_load_node = self.get_memory_load_node(
@@ -380,22 +382,42 @@ class LLMConverter:
                                 encode_message(g, weight_load_node)
                             # Compute
                             if layers[layer_num].comp_time != 0 and not pim_start: # pim computation is handled pim_comp_node
-                                comp_node = self.get_comp_node(
-                                    layers[layer_num].name, 
-                                    layers[layer_num].comp_time)
+                                layer_name_for_deps = str(layers[layer_num].name)
+                                expert_pim_transfer = (
+                                    layer_name_for_deps.startswith(("xfer_in", "xfer_out"))
+                                    or str(getattr(layers[layer_num], "misc", "")).startswith("PIM_XFER")
+                                )
+                                if expert_pim_transfer:
+                                    comp_node = self.get_pim_compute_node(
+                                        layers[layer_num].name,
+                                        "PIM_XFER",
+                                        layers[layer_num].comp_time,
+                                        layers[layer_num].input_memory_loc,
+                                        0)
+                                else:
+                                    comp_node = self.get_comp_node(
+                                        layers[layer_num].name,
+                                        layers[layer_num].comp_time)
                                 layers[layer_num].comp_node = comp_node
+                                expert_fork_root = (
+                                    (expert_start or expert_parent_node is not None)
+                                    and layer_name_for_deps.startswith((
+                                        "expert_hot", "xfer_in"))
+                                )
 
                                 # handle pim parent nodes, and if prefill attention remains wait until all attention is done (before o_proj)
                                 if len(pim_parent_nodes) != 0:
                                     if attn_remain:
-                                        for parent in pim_parent_nodes: 
+                                        for parent in pim_parent_nodes:
                                             self.add_parent(comp_node, parent)
                                     pim_parent_nodes = [] # reset pim parent nodes
 
                                     if "attn" in layers[layer_num].name:
                                         attn_remain = False
-                                else: 
-                                    if first_comp_node:
+                                else:
+                                    if expert_fork_root:
+                                        pass
+                                    elif first_comp_node:
                                         if npu_group == 0:
                                             self.add_parent(comp_node, input_load_node)
                                         else:
@@ -419,7 +441,7 @@ class LLMConverter:
 
                                 # handle pim_compute_mode dependency & should not be remaining attention
                                 if not attn_remain and len(pim_comp_nodes) != 0:
-                                    if layers[layer_num].misc == "NONE": # no sub-batch interleaving
+                                    if layers[layer_num].misc == "NONE" or expert_pim_transfer: # no sub-batch interleaving or expert-PIM transfer join
                                         for pim_comp in pim_comp_nodes:
                                             self.add_parent(comp_node, pim_comp)
                                         pim_comp_nodes = [] # reset pim comp nodes
@@ -430,6 +452,28 @@ class LLMConverter:
                                         past_pim_comp_nodes = pim_comp_nodes # update past pim comp nodes
                                         pim_comp_nodes = [] # reset pim comp nodes
                                         last_batch_type = layers[layer_num].misc
+
+                                # Expert-PIM offload creates a fork: hot NPU expert
+                                # compute and NPU->CPU/PIM input transfer both begin
+                                # after the expert dispatch/gate parent. The generic
+                                # converter dependency logic is sequential, so override
+                                # only these explicit fork-root rows and leave output-
+                                # transfer/join rows sequential on the cold path.
+                                if expert_fork_root:
+                                    del comp_node.data_deps[:]
+                                    if expert_parent_node is not None:
+                                        self.add_parent(comp_node, expert_parent_node)
+                                    if layers[layer_num].weight_memory_node != None:
+                                        self.add_parent(comp_node, layers[layer_num].weight_memory_node)
+                                if expert_start and layer_name_for_deps.startswith("expert_hot"):
+                                    expert_parallel_terminals.append(comp_node)
+                                elif expert_start and layer_name_for_deps.startswith("expert_pim_join"):
+                                    seen = set(comp_node.data_deps)
+                                    for parent in expert_parallel_terminals:
+                                        if parent.id not in seen:
+                                            self.add_parent(comp_node, parent)
+                                            seen.add(parent.id)
+                                    expert_parallel_terminals = [comp_node]
 
                                 encode_message(g, comp_node)
 
@@ -461,12 +505,16 @@ class LLMConverter:
                         # expert layer starts
                         elif layers[layer_num].is_expert:
                             # communication can happen even with one NPU in the group, for example, expert input gathering in data parallel
-                            if expert_start == False and layers[layer_num].comm_size > 0 and layers[layer_num].comm_type != "NONE": 
-                                # Start of expert, add ALLTOALL communication before expert computation
-                                comm_coll_node = self.get_comm_coll_node("expert_start", layers[layer_num].comm_type, layers[layer_num].comm_size, layers[layer_num].involved_dim)
-                                layers[layer_num].comm_node = comm_coll_node
-                                self.add_parent(comm_coll_node, comp_node)
-                                encode_message(g, comm_coll_node)
+                            if expert_start == False:
+                                expert_parallel_terminals = []
+                                expert_parent_node = comp_node
+                                if layers[layer_num].comm_size > 0 and layers[layer_num].comm_type != "NONE":
+                                    # Start of expert, add ALLTOALL communication before expert computation
+                                    comm_coll_node = self.get_comm_coll_node("expert_start", layers[layer_num].comm_type, layers[layer_num].comm_size, layers[layer_num].involved_dim)
+                                    layers[layer_num].comm_node = comm_coll_node
+                                    self.add_parent(comm_coll_node, comp_node)
+                                    encode_message(g, comm_coll_node)
+                                    expert_parent_node = comm_coll_node
                             expert_start = True
                             # check expert end
                             if layers[layer_num].expert_num == 'END':
@@ -478,6 +526,8 @@ class LLMConverter:
                                     layers[layer_num].comm_node = comm_coll_node
                                     self.add_parent(comm_coll_node, comp_node)
                                     encode_message(g, comm_coll_node)
+                                expert_parent_node = None
+                                expert_parallel_terminals = []
                                 layer_num += 1
                                 continue
                             # round robin assignment
@@ -589,7 +639,7 @@ class LLMConverter:
                             self.add_parent(send_output_node, layers[layer_end - 2].comp_node)
                         encode_message(g, send_output_node)
             remain_layers -= 1
-    
+
     def convert_prefill(self, f: TextIOWrapper, num_layers: int, num_npu_group: int):
         layers: list[Layer] = self.get_layers(f)
         # There will be no pim operation in prefill (PIM cannot perform GEMM)
@@ -616,7 +666,7 @@ class LLMConverter:
             else:
                 continue
             ev_ld_cnt += 1
-            
+
         layers = layers[ev_ld_cnt:]
         num_layers -= ev_ld_cnt
 
@@ -658,7 +708,7 @@ class LLMConverter:
                             layers[layer_start].input_memory_loc,
                             layers[layer_start].input_memory_size,
                         )
-                        encode_message(g, input_load_node)                  
+                        encode_message(g, input_load_node)
                     else:
                         if layers[layer_start].is_expert:
                             # Receive input (from the previous layer in another npu group)
@@ -699,11 +749,11 @@ class LLMConverter:
                                 if expert_start:
                                     self.add_parent(weight_load_node, comp_node) # dependent to previous comp_node due to gate function
                                 encode_message(g, weight_load_node)
-                            
+
                             # Compute
                             if layers[layer_num].comp_time != 0:
                                 comp_node = self.get_comp_node(
-                                    layers[layer_num].name, 
+                                    layers[layer_num].name,
                                     layers[layer_num].comp_time)
                                 layers[layer_num].comp_node = comp_node
 
@@ -728,7 +778,7 @@ class LLMConverter:
                                         self.add_parent(comp_node, layers[layer_num - 1].comp_node)
                                     else:
                                         self.add_parent(comp_node, layers[layer_num - 2].comp_node)
-                                
+
                                 encode_message(g, comp_node)
 
                                 # Send KV cache after each kv_proj
@@ -770,7 +820,7 @@ class LLMConverter:
                         # expert layer starts
                         elif layers[layer_num].is_expert:
                             # communication can happen even with one NPU in the group, for example, expert input gathering in data parallel
-                            if expert_start == False and layers[layer_num].comm_size > 0 and layers[layer_num].comm_type != "NONE": 
+                            if expert_start == False and layers[layer_num].comm_size > 0 and layers[layer_num].comm_type != "NONE":
                                 # Start of expert, add ALLTOALL communication before expert computation
                                 comm_coll_node = self.get_comm_coll_node("expert_start", layers[layer_num].comm_type, layers[layer_num].comm_size, layers[layer_num].involved_dim)
                                 layers[layer_num].comm_node = comm_coll_node
@@ -869,7 +919,7 @@ class LLMConverter:
                 encode_message(g, global_metadata)
                 for idx, layer in enumerate(layers):
                     comp_node = self.get_comp_node(
-                    layer.name, 
+                    layer.name,
                     layer.comp_time)
                     layer.comp_node = comp_node
                     encode_message(g, comp_node)
