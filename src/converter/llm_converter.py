@@ -20,9 +20,11 @@ class MemoryType(Enum):
 
 
 class Layer:
-    def __init__(self, line: str):
+    def __init__(self, line: str = None, cols: List[str] = None):
         try:
-            col = line.strip().split()
+            # ``cols`` lets a caller that already holds the fields skip the
+            # format-and-resplit round trip; ``line`` is the text path.
+            col = cols if cols is not None else line.strip().split()
             if col[0] == 'EXPERT': # If Expert Flag
                 self.name = col[0]
                 self.expert_num = col[1]
@@ -104,22 +106,89 @@ class LLMConverter:
         self.next_comm_tag = 0
         self.comm_tag_dict = dict()
 
+        # Set by convert_rows so get_layers can return them instead of
+        # parsing a file. See convert_rows.
+        self._layers = None
+
     def get_global_metadata(self):
-        input_text = ""
-        with open(self.input_filename, "r") as input_file:
-            input_text = input_file.read()
+        # ``input_file`` carries the trace's *path*, not its contents.
+        #
+        # It used to embed the whole trace text. Nothing consumes it:
+        # ETFeeder::readGlobalMetadata() reads the message into a local
+        # shared_ptr and drops it on the floor, and no other reader touches
+        # the attribute. So every byte of it was written by the converter,
+        # re-parsed by the feeder's protobuf reader, and discarded.
+        #
+        # It was not a small overhead. On the swe-bench MoE DP+EP example a
+        # trace is ~82 KB of a 117 KB .et -- 70% of the file -- and the
+        # simulator generates 8,810 of them for one session, so it was
+        # ~720 MB of encode/write/read/parse per run, plus a second full
+        # read of the trace file here purely to obtain the text.
+        #
+        # The path keeps the provenance that made this attribute useful for
+        # debugging; the trace itself is written to disk by --save-trace-text.
         attr = [
             ChakraAttr(name="schema", string_val="1.0.2-chakra.0.0.4"),
-            ChakraAttr(name="input_file", string_val=input_text),
+            ChakraAttr(name="input_file", string_val=self.input_filename),
         ]
         metadata = GlobalMetadata(attr=attr)
         return metadata
 
     def get_layers(self, f: TextIOWrapper) -> List[Layer]:
+        if self._layers is not None:
+            return self._layers
         layers: List[Layer] = []
         for line in f:
             layers.append(Layer(line))
         return layers
+
+    def convert_rows(self, header_line: str, rows: List[List[str]]) -> None:
+        """Convert from pre-parsed field lists, with no text round trip.
+
+        The simulator already holds every field. Formatting them into padded
+        columns, writing the file, reading it back and splitting each line
+        again is pure overhead now that the converter runs in the same
+        process -- 0.65 ms of formatting and writing per batch plus 0.9 ms of
+        reading and re-parsing, against 8,810 batches on the swe-bench MoE
+        DP+EP example.
+
+        Nothing downstream changes: convert_common, convert_prefill and
+        convert_event each touch the file handle exactly once, to call
+        get_layers, so seeding the layers is the whole of it. Header parsing
+        mirrors convert() on a string instead of a readline, and num_layers
+        is len(rows) -- which is precisely what convert() reads off line two,
+        since that is what the writer puts there.
+        """
+        self._layers = [Layer(cols=cols) for cols in rows]
+
+        first_line = header_line.strip().split()
+        execution_type = first_line[0]
+
+        header = {}
+        fields = first_line[1:]
+        for i in range(0, len(fields) - 1, 2):
+            if fields[i].endswith(":"):
+                header[fields[i][:-1]] = fields[i + 1]
+
+        num_npu_group = int(header.get("model_parallel_NPU_group", 0))
+        boundary_str = header.get("pp_stage_boundaries", "")
+        stage_boundaries = (
+            [int(b) for b in boundary_str.split(",")] if boundary_str else []
+        )
+        num_layers = len(rows)
+
+        if execution_type in ("COLOCATED", "DECODE"):
+            if num_npu_group <= 0:
+                raise ValueError(f"model_parallel_NPU_group <= 0")
+            self.convert_common(None, num_layers, num_npu_group, stage_boundaries)
+        elif execution_type == "PREFILL":
+            if num_npu_group <= 0:
+                raise ValueError(f"model_parallel_NPU_group <= 0")
+            self.convert_prefill(None, num_layers, num_npu_group, stage_boundaries)
+        elif execution_type == "EVENT":
+            self.convert_event(None, num_layers)
+        else:
+            raise ValueError(f"Unsupported execution type, {execution_type}")
 
     def get_next_node_id(self) -> int:
         ret = self.next_node_id
@@ -266,7 +335,38 @@ class LLMConverter:
     def add_parent(self, child_node: Any, parent_node: Any) -> None:
         child_node.data_deps.append(parent_node.id)
 
-    def convert_common(self, f: TextIOWrapper, num_layers: int, num_npu_group: int):
+    def get_stage_edges(self, num_layers: int, num_npu_group: int,
+                        stage_boundaries: List[int]) -> List[Any]:
+        """Resolve the [start, end) trace-line range owned by each pipeline stage.
+
+        ``stage_boundaries`` comes from the trace header and holds the line
+        index at which every stage after the first begins. The frontend puts
+        those cuts on transformer-block boundaries, which is what makes the
+        tensor crossing a stage boundary the hidden state: the sending
+        layer's output_size then equals the receiving layer's input_size, and
+        the SEND/RECV pair matches in ASTRA-sim (its callback tracker keys on
+        chunk size, so a mismatch deadlocks the run instead of erroring).
+        Splitting the line count evenly instead lands cuts inside a block --
+        e.g. between qkv_proj and rotary_emb, whose declared sizes differ by
+        the V projection -- so do not reintroduce that.
+        """
+        if num_npu_group == 1:
+            return [(0, num_layers)]
+        if len(stage_boundaries) != num_npu_group - 1:
+            raise ValueError(
+                f"trace declares model_parallel_NPU_group: {num_npu_group} but "
+                f"carries {len(stage_boundaries)} pp_stage_boundaries "
+                f"(expected {num_npu_group - 1}); regenerate the trace")
+        edges = [0] + list(stage_boundaries) + [num_layers]
+        for i in range(len(edges) - 1):
+            if not 0 <= edges[i] < edges[i + 1] <= num_layers:
+                raise ValueError(
+                    f"pp_stage_boundaries {stage_boundaries} are not a strictly "
+                    f"increasing split of {num_layers} layers")
+        return [(edges[i], edges[i + 1]) for i in range(num_npu_group)]
+
+    def convert_common(self, f: TextIOWrapper, num_layers: int, num_npu_group: int,
+                       stage_boundaries: List[int] = None):
         layers: list[Layer] = self.get_layers(f)
 
         # vllm: check eviction or load
@@ -301,18 +401,14 @@ class LLMConverter:
             use_comm = False
         else:
             use_comm = True
-        layers_per_group = num_layers // num_npu_group
-        remain_layers = num_layers % num_npu_group
-
-        layer_start = 0
-        layer_end = 0
+        stage_edges = self.get_stage_edges(num_layers, num_npu_group,
+                                           stage_boundaries or [])
 
         for npu_group in range(num_npu_group):
-            layer_start = layer_end
-            layer_end = layer_start + layers_per_group + (1 if remain_layers > 0 else 0)
-            if layer_end >= num_layers:
-                layer_end = num_layers
             for npu_offset in range(npus_per_group):
+                # Re-read the authoritative edges per rank: the walk below may
+                # rebind layer_end if it ever overruns.
+                layer_start, layer_end = stage_edges[npu_group]
                 npu_id = npu_group * npus_per_group + npu_offset + self.npu_offset
                 output_filename = "%s.%d.et" % (self.output_filename, npu_id)
                 first_comp_node = True
@@ -555,7 +651,7 @@ class LLMConverter:
                             elif int(layers[layer_num].pim_num) == 0:
                                 if first_comp_node:
                                     if npu_group == 0:
-                                        pim_parent_nodes.append()
+                                        pim_parent_nodes.append(input_load_node)
                                     else:
                                         pim_parent_nodes.append(receive_input_node)
                                     if evict != None:
@@ -583,16 +679,36 @@ class LLMConverter:
                             else:
                                 layer_num += 1
 
-                    # update new layer_end
-                    layer_end = layer_num
+                    # The frontend cuts stages on transformer-block boundaries,
+                    # so the walk above lands exactly on the stage edge. Expert
+                    # and PIM blocks live inside a block and can no longer be
+                    # straddled; warn loudly if that ever stops holding.
+                    if layer_num != layer_end:
+                        print(f"Warning! pipeline stage {npu_group} walked to "
+                              f"layer {layer_num}, expected {layer_end}")
+                        layer_end = layer_num
 
                     if npu_group == (num_npu_group - 1):
                         # Store output (for the last layer)
+                        # The last layer is the sampler: what crosses back to
+                        # the host is its OUTPUT, the sampled token ids, 4 bytes
+                        # per sequence.
+                        #
+                        # Do not switch this back to input_memory_size. That read
+                        # was a deliberate down-scaling when lm_head was the last
+                        # trace layer: its output is the logits
+                        # (num_seqs * vocab_size * dtype) and billing those to CPU
+                        # memory every iteration was a large overcharge, so the
+                        # smaller input (the hidden state) stood in. Once sampler
+                        # was appended as the new last layer the two swapped
+                        # roles -- sampler's output is the token ids and its input
+                        # is the logits -- so reading the input landed back on
+                        # exactly the tensor the workaround existed to avoid.
                         output_store_node = self.get_memory_store_node(
                             layers[layer_end - 1].name,
                             "OUTPUT",
                             layers[layer_end - 1].output_memory_loc,
-                            layers[layer_end - 1].input_memory_size,
+                            layers[layer_end - 1].output_memory_size,
                         )
                         # if pim_comp_nodes are not consumed yet, add dependency
                         if len(pim_comp_nodes) != 0:
@@ -638,9 +754,9 @@ class LLMConverter:
                         else:
                             self.add_parent(send_output_node, layers[layer_end - 2].comp_node)
                         encode_message(g, send_output_node)
-            remain_layers -= 1
-
-    def convert_prefill(self, f: TextIOWrapper, num_layers: int, num_npu_group: int):
+    
+    def convert_prefill(self, f: TextIOWrapper, num_layers: int, num_npu_group: int,
+                        stage_boundaries: List[int] = None):
         layers: list[Layer] = self.get_layers(f)
         # There will be no pim operation in prefill (PIM cannot perform GEMM)
 
@@ -676,18 +792,14 @@ class LLMConverter:
             use_comm = False
         else:
             use_comm = True
-        layers_per_group = num_layers // num_npu_group
-        remain_layers = num_layers % num_npu_group
-
-        layer_start = 0
-        layer_end = 0
+        stage_edges = self.get_stage_edges(num_layers, num_npu_group,
+                                           stage_boundaries or [])
 
         for npu_group in range(num_npu_group):
-            layer_start = layer_end
-            layer_end = layer_start + layers_per_group + (1 if remain_layers > 0 else 0)
-            if layer_end >= num_layers:
-                layer_end = num_layers
             for npu_offset in range(npus_per_group):
+                # Re-read the authoritative edges per rank: the walk below may
+                # rebind layer_end if it ever overruns.
+                layer_start, layer_end = stage_edges[npu_group]
                 npu_id = npu_group * npus_per_group + npu_offset + self.npu_offset
                 output_filename1 = "%s.%d.et" % (self.output_filename, npu_id)
                 output_filename2 = "%s.%d.et" % (self.output_filename, npu_id + self.num_npus) # sender for prefill-decode
@@ -781,13 +893,21 @@ class LLMConverter:
 
                                 encode_message(g, comp_node)
 
-                                # Send KV cache after each kv_proj
-                                if "v_proj" in layers[layer_num].name:
+                                # Send KV cache after each kv_proj.
+                                # comm_size comes from the trace's comm_size
+                                # column, which the frontend fills with the
+                                # per-layer, per-rank K+V bytes. It used to read
+                                # output_memory_size, i.e. the whole QKV
+                                # activation, which shipped Q as well and
+                                # overstated the transfer by
+                                # (q_dim + 2*kv_dim) / (2*kv_dim) -- 3x for
+                                # Llama-3.1-8B -- and ignored kv_cache_dtype.
+                                if "v_proj" in layers[layer_num].name and layers[layer_num].comm_size > 0:
                                     send_kv_node = self.get_comm_node(
                                         is_send=True,
                                         layer_name="kv_proj",
                                         comm_type=layers[layer_num].comm_type,
-                                        comm_size=layers[layer_num].output_memory_size,
+                                        comm_size=layers[layer_num].comm_size,
                                         comm_src=npu_id,
                                         comm_dst=npu_id + self.num_npus, # to the paired npu in decode
                                         id=layer_num
@@ -799,7 +919,7 @@ class LLMConverter:
                                         is_send=False,
                                         layer_name="kv_proj",
                                         comm_type=layers[layer_num].comm_type,
-                                        comm_size=layers[layer_num].output_memory_size,
+                                        comm_size=layers[layer_num].comm_size,
                                         comm_src=npu_id,
                                         comm_dst=npu_id + self.num_npus,
                                         id=layer_num
@@ -851,8 +971,14 @@ class LLMConverter:
                                 layers[layer_num].comp_node = comp_node # is latest comp_node
                                 layer_num += 1
 
-                    # update new layer_end
-                    layer_end = layer_num
+                    # The frontend cuts stages on transformer-block boundaries,
+                    # so the walk above lands exactly on the stage edge. Expert
+                    # and PIM blocks live inside a block and can no longer be
+                    # straddled; warn loudly if that ever stops holding.
+                    if layer_num != layer_end:
+                        print(f"Warning! pipeline stage {npu_group} walked to "
+                              f"layer {layer_num}, expected {layer_end}")
+                        layer_end = layer_num
 
                     if npu_group == (num_npu_group - 1):
                         # Send output (for the last layer, to the paired decode npu)
@@ -908,7 +1034,6 @@ class LLMConverter:
                         else:
                             self.add_parent(send_output_node, layers[layer_end - 2].comp_node)
                         encode_message(g, send_output_node)
-            remain_layers -= 1
 
     def convert_event(self, f: TextIOWrapper, num_layers: int):
         layers: list[Layer] = self.get_layers(f)
@@ -929,11 +1054,19 @@ class LLMConverter:
             first_line = f.readline().strip().split()
             execution_type = first_line[0]
 
-            if len(first_line) == 3:
-                assert(first_line[1] == "model_parallel_NPU_group:")
-                num_npu_group = int(first_line[2])
-            else:
-                num_npu_group = 0
+            # The first line carries "key: value" pairs after the execution
+            # type, e.g. "model_parallel_NPU_group: 4  pp_stage_boundaries: 73,145,217".
+            header = {}
+            fields = first_line[1:]
+            for i in range(0, len(fields) - 1, 2):
+                if fields[i].endswith(":"):
+                    header[fields[i][:-1]] = fields[i + 1]
+
+            num_npu_group = int(header.get("model_parallel_NPU_group", 0))
+            boundary_str = header.get("pp_stage_boundaries", "")
+            stage_boundaries = (
+                [int(b) for b in boundary_str.split(",")] if boundary_str else []
+            )
 
             second_line = f.readline().strip()
             num_layers = int(second_line)
@@ -943,15 +1076,15 @@ class LLMConverter:
             if execution_type == "COLOCATED":
                 if num_npu_group <= 0:
                     raise ValueError(f"model_parallel_NPU_group <= 0")
-                self.convert_common(f, num_layers, num_npu_group)
+                self.convert_common(f, num_layers, num_npu_group, stage_boundaries)
             elif execution_type == "PREFILL":
                 if num_npu_group <= 0:
                     raise ValueError(f"model_parallel_NPU_group <= 0")
-                self.convert_prefill(f, num_layers, num_npu_group)
+                self.convert_prefill(f, num_layers, num_npu_group, stage_boundaries)
             elif execution_type == "DECODE":
                 if num_npu_group <= 0:
                     raise ValueError(f"model_parallel_NPU_group <= 0")
-                self.convert_common(f, num_layers, num_npu_group)
+                self.convert_common(f, num_layers, num_npu_group, stage_boundaries)
             elif execution_type == "EVENT":
                 self.convert_event(f, num_layers)
             else:
